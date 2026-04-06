@@ -1,0 +1,50 @@
+# MaSecure — Environnement de développement local
+# Lance PostgreSQL et NATS pour le développement du MVP.
+# NE PAS utiliser en production tel quel (pas de TLS, mots de passe simples).
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: masecure-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       masecure_dev
+      POSTGRES_USER:     masecure
+      POSTGRES_PASSWORD: masecure_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - masecure_pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:Z  # Exécute les migrations au démarrage
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U masecure -d masecure_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: masecure-nats
+    restart: unless-stopped
+    command: ["--jetstream", "--store_dir", "/data"]
+    ports:
+      - "4222:4222"   # Client connections
+      - "8222:8222"   # HTTP monitoring
+    volumes:
+      - masecure_nats:/data
+
+  # Adminer : interface web légère pour inspecter la base de données
+  adminer:
+    image: adminer:latest
+    container_name: masecure-adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  masecure_pgdata:
+  masecure_nats:

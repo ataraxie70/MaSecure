@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.DS_Store
+*.local
+.env
+.env.local
+.env.*.local
+*.log
+pnpm-debug.log*
+.idea/
+.vscode/
+*.md
+/docs/

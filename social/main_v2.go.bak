@@ -1,0 +1,304 @@
+// Package main — Service Social MaSecure
+//
+// Ce service orchestre les domaines non-financiers :
+//   - Phase 3 : Gouvernance (propositions, votes, configuration versionnée)
+//   - Phase 3 : Export d'audit (ledger + contributions)
+//   - Phase 4 : Dashboard groupe (cycle actif, fonds de roulement, dettes)
+//   - Phase 5 : Monitoring opérationnel (anomalies, conformité)
+//
+// Ce service ne possède AUCUNE clé Mobile Money.
+// Il produit des UserIntent et des ProposalCommit, jamais des PayoutCommand.
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
+	"masecure/internal/anomaly"
+	"masecure/internal/compliance"
+	"masecure/social/audit"
+	"masecure/social/dashboard"
+	"masecure/social/governance"
+)
+
+func main() {
+	log := buildLogger()
+	defer log.Sync()
+
+	log.Info("MaSecure Social Service starting")
+
+	// ── Configuration ─────────────────────────────────────────────────────────
+	dbURL := mustEnv("DATABASE_URL")
+	listenAddr := getEnv("SOCIAL_HTTP_ADDR", "0.0.0.0:8002")
+	serviceName := getEnv("SOCIAL_SERVICE_NAME", "social-service@1.0.0")
+
+	// ── Connexion PostgreSQL ──────────────────────────────────────────────────
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		log.Fatal("Failed to connect PostgreSQL", zap.Error(err))
+	}
+	defer pool.Close()
+
+	if err := pool.Ping(ctx); err != nil {
+		log.Fatal("PostgreSQL ping failed", zap.Error(err))
+	}
+	log.Info("PostgreSQL connection established")
+
+	// ── Assemblage des services ────────────────────────────────────────────────
+
+	// Phase 3 : Gouvernance
+	pgStore := governance.NewPgProposalStore(pool)
+	govService := governance.NewService(pgStore)
+	govHandler := governance.NewHTTPHandler(govService, log)
+
+	// Phase 3 : Audit
+	auditService := audit.NewService(pool, serviceName)
+	auditHandler := audit.NewHandler(auditService, log)
+
+	// Phase 4 : Dashboard
+	dashHandler := dashboard.NewHandler(pool, log)
+
+	// Phase 5 : Anomaly + Compliance
+	alertSink := anomaly.NewLogAlertSink(log)
+	detector := anomaly.NewDetector(pool, anomaly.DefaultThresholds(), alertSink, log)
+	complianceSvc := compliance.NewService(pool, log)
+	monitoringHandler := NewMonitoringHandler(detector, complianceSvc, pool, log)
+
+	// ── Routeur ───────────────────────────────────────────────────────────────
+	r := chi.NewRouter()
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+	r.Use(middleware.Timeout(30 * time.Second))
+
+	// Health check
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"status":"ok","service":"social","version":"1.0.0"}`)
+	})
+
+	// Phase 3 : Gouvernance
+	govHandler.RegisterRoutes(r)
+
+	// Phase 3 : Audit
+	auditHandler.RegisterRoutes(r)
+
+	// Phase 4 : Dashboard
+	dashHandler.RegisterRoutes(r)
+
+	// Phase 5 : Monitoring
+	monitoringHandler.RegisterRoutes(r)
+
+	log.Info("Routes registered",
+		zap.String("addr", listenAddr),
+	)
+
+	// ── Scheduler anomaly (Phase 5) ────────────────────────────────────────────
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	go func() {
+		ticker := time.NewTicker(15 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-ticker.C:
+				if err := detector.RunAllChecks(workerCtx); err != nil {
+					log.Error("Anomaly scan failed", zap.Error(err))
+				}
+			}
+		}
+	}()
+
+	// ── Scheduler compliance mensuel (Phase 5) ────────────────────────────────
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-ticker.C:
+				now := time.Now().UTC()
+				// Exécuter uniquement le 1er du mois
+				if now.Day() == 1 {
+					if err := complianceSvc.RunPeriodicCompliance(workerCtx); err != nil {
+						log.Error("Monthly compliance failed", zap.Error(err))
+					}
+				}
+			}
+		}
+	}()
+
+	// ── Scheduler expiration des propositions (Phase 3) ───────────────────────
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-ticker.C:
+				expired, err := pgStore.ExpireStaleProposals(workerCtx)
+				if err != nil {
+					log.Error("Expire proposals failed", zap.Error(err))
+				} else if expired > 0 {
+					log.Info("Expired stale proposals", zap.Int64("count", expired))
+				}
+			}
+		}
+	}()
+
+	// ── Serveur HTTP ──────────────────────────────────────────────────────────
+	server := &http.Server{
+		Addr:         listenAddr,
+		Handler:      r,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+
+	go func() {
+		log.Info("Social Service HTTP listening", zap.String("addr", listenAddr))
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal("HTTP server error", zap.Error(err))
+		}
+	}()
+
+	<-sigCh
+	log.Info("Shutdown signal received")
+	cancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Error("Graceful shutdown failed", zap.Error(err))
+	}
+	log.Info("Social Service stopped cleanly")
+}
+
+// ── MonitoringHandler (Phase 5) ───────────────────────────────────────────────
+
+type MonitoringHandler struct {
+	detector      *anomaly.Detector
+	compliance    *compliance.Service
+	db            *pgxpool.Pool
+	log           *zap.Logger
+}
+
+func NewMonitoringHandler(
+	detector *anomaly.Detector,
+	complianceSvc *compliance.Service,
+	db *pgxpool.Pool,
+	log *zap.Logger,
+) *MonitoringHandler {
+	return &MonitoringHandler{
+		detector:   detector,
+		compliance: complianceSvc,
+		db:         db,
+		log:        log,
+	}
+}
+
+func (h *MonitoringHandler) RegisterRoutes(r chi.Router) {
+	r.Post("/internal/monitoring/scan", h.TriggerScan)
+	r.Post("/internal/compliance/archive/{groupID}", h.GenerateArchive)
+	r.Get("/internal/ops/health", h.OpsHealth)
+}
+
+func (h *MonitoringHandler) TriggerScan(w http.ResponseWriter, r *http.Request) {
+	if err := h.detector.RunAllChecks(r.Context()); err != nil {
+		http.Error(w, "scan failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status":"ok","message":"anomaly scan completed"}`)
+}
+
+func (h *MonitoringHandler) GenerateArchive(w http.ResponseWriter, r *http.Request) {
+	groupID := chi.URLParam(r, "groupID")
+	now := time.Now().UTC()
+	from := now.AddDate(0, -1, 0)
+
+	archive, err := h.compliance.GenerateGroupArchive(r.Context(), groupID, from, now)
+	if err != nil {
+		http.Error(w, "archive failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"archive_id":"%s","status":"%s","hash":"%s"}`,
+		archive.ArchiveID, archive.ComplianceStatus, archive.ContentHash)
+}
+
+func (h *MonitoringHandler) OpsHealth(w http.ResponseWriter, r *http.Request) {
+	// Interroge la vue ops_health_dashboard
+	var pending, failed, deadLetter, disputed int
+	h.db.QueryRow(r.Context(), `
+		SELECT outbox_pending, outbox_failed, outbox_dead_letter, cycles_disputed
+		FROM ops_health_dashboard
+	`).Scan(&pending, &failed, &deadLetter, &disputed)
+
+	status := "ok"
+	if deadLetter > 10 || disputed > 0 {
+		status = "degraded"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{
+		"status": "%s",
+		"outbox_pending": %d,
+		"outbox_failed": %d,
+		"outbox_dead_letter": %d,
+		"cycles_disputed": %d,
+		"checked_at": "%s"
+	}`, status, pending, failed, deadLetter, disputed, time.Now().UTC().Format(time.RFC3339))
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+func mustEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		fmt.Fprintf(os.Stderr, "FATAL: %s required\n", key)
+		os.Exit(1)
+	}
+	return v
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func buildLogger() *zap.Logger {
+	level := zap.NewAtomicLevelAt(zapcore.InfoLevel)
+	if os.Getenv("LOG_LEVEL") == "debug" {
+		level = zap.NewAtomicLevelAt(zapcore.DebugLevel)
+	}
+	cfg := zap.Config{
+		Level: level, Development: false, Encoding: "json",
+		EncoderConfig: zap.NewProductionEncoderConfig(),
+		OutputPaths:   []string{"stdout"}, ErrorOutputPaths: []string{"stderr"},
+	}
+	log, _ := cfg.Build()
+	return log
+}

@@ -1,0 +1,19 @@
+# Environnement
+.env
+*.env.local
+
+# Rust
+kernel/target/
+kernel/Cargo.lock
+
+# Go
+vendor/
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
