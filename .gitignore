@@ -17,3 +17,9 @@ vendor/
 
 # OS
 .DS_Store
+
+# Documentation & Markdown (except README.md)
+*.md
+!README.md
+/docs/
+docs/**/*
