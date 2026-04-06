@@ -9,5 +9,11 @@ dist/
 pnpm-debug.log*
 .idea/
 .vscode/
+
+# Exclude all markdown files except README.md
 *.md
+!README.md
+
+# Exclude all documentation
 /docs/
+docs/**/*
